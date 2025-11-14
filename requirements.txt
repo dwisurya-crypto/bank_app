@@ -1,7 +1,8 @@
 streamlit
-PyPDF2
 pdfplumber
 pandas
 gspread
 google-auth
-
+google-auth-oauthlib
+google-auth-httplib2
+PyPDF2
