@@ -41,6 +41,22 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 
+# How many PDF pages to process before flushing a chunk to Google Sheets
+CHUNK_PAGES = 50  # you can lower this (e.g. 25) if still hitting limits
+
+
+# Standard column order for the sheet
+ORDERED_COLS = [
+    "Posting Date",
+    "Value Date",
+    "Transaction Branch",
+    "Reference Number",
+    "Description",
+    "Debit",
+    "Credit",
+    "Balance",
+]
+
 
 # =========================
 # GOOGLE SHEETS HELPER
@@ -56,74 +72,87 @@ def get_gspread_client():
     return client
 
 
-def upload_df_to_gsheet(df: pd.DataFrame):
-    """
-    Upload the given DataFrame to the configured Google Sheet and worksheet.
-    Clears existing data and writes the new one.
-    """
-    client = get_gspread_client()
+def get_or_create_worksheet(client):
+    """Open the target sheet and get/create the target worksheet."""
     sh = client.open_by_key(SPREADSHEET_ID)
 
-    # Get or create worksheet
     try:
         worksheet = sh.worksheet(WORKSHEET_NAME)
     except gspread.WorksheetNotFound:
         worksheet = sh.add_worksheet(
             title=WORKSHEET_NAME,
-            rows=str(len(df) + 10),
-            cols=str(len(df.columns) + 5),
+            rows="1000",
+            cols=str(len(ORDERED_COLS) + 5),
         )
 
-    # Clear existing data
+    return worksheet
+
+
+def init_worksheet_with_header(worksheet):
+    """
+    Clear existing data and write the header row only.
+    Returns the next row index where data should be written (2).
+    """
     worksheet.clear()
+    worksheet.update("A1", [ORDERED_COLS])
+    return 2  # next row after header
 
-    # Ensure column order (for safety)
-    ordered_cols = [
-        "Posting Date",
-        "Value Date",
-        "Transaction Branch",
-        "Reference Number",
-        "Description",
-        "Debit",
-        "Credit",
-        "Balance",
-    ]
-    df = df[ordered_cols]
 
-    # Prepare values: header row + data rows as list of lists
-    values = [list(df.columns)] + df.astype(str).fillna("").values.tolist()
+def append_chunk_to_worksheet(worksheet, df_chunk: pd.DataFrame, start_row: int) -> int:
+    """
+    Append a DataFrame chunk to the worksheet starting at the given row.
+    Returns the next row index after the written block.
+    """
+    if df_chunk.empty:
+        return start_row
 
-    # Write starting at A1
-    worksheet.update("A1", values)
+    df_chunk = df_chunk[ORDERED_COLS]
+    values = df_chunk.astype(str).fillna("").values.tolist()
+
+    # Write starting at A<start_row>
+    range_str = f"A{start_row}"
+    worksheet.update(range_str, values)
+
+    next_row = start_row + len(values)
+    return next_row
 
 
 # =========================
-# PDF EXTRACTION LOGIC
+# PDF EXTRACTION + STREAMING TO GSHEETS
 # =========================
 
-def extract_transactions_from_pdf(uploaded_pdf, progress_callback=None) -> pd.DataFrame:
+def process_pdf_and_stream_to_gsheet(uploaded_pdf, progress_callback=None) -> int:
     """
-    Read the uploaded PDF and return a DataFrame with columns:
-    Posting Date, Value Date, Transaction Branch,
-    Reference Number, Description, Debit, Credit, Balance
+    Read the uploaded PDF, extract all transactions, and stream them
+    to Google Sheets in chunks to avoid memory issues.
+
+    Returns:
+        total_records (int): total number of rows written to Google Sheets.
     """
-    # Read bytes once, then immediately drop reference to the uploader object
+    # Read bytes once
     file_bytes = uploaded_pdf.read()
     pdf_file = io.BytesIO(file_bytes)
 
-    # Best-effort: drop references early
+    # Drop reference to the uploader as early as possible
     uploaded_pdf = None
     del uploaded_pdf
     gc.collect()
 
-    records = []
+    # Prepare Google Sheets
+    client = get_gspread_client()
+    worksheet = get_or_create_worksheet(client)
+    next_row_index = init_worksheet_with_header(worksheet)
+
+    total_records = 0
 
     with pdfplumber.open(pdf_file) as pdf:
         total_pages = len(pdf.pages)
 
+        chunk_records = []
+
         for page_idx, page in enumerate(pdf.pages, start=1):
-            # Update progress in Streamlit if callback is provided
-            if progress_callback is not None:
+            # Progress update
+            if progress_callback is not None and total_pages > 0:
                 progress_callback(page_idx, total_pages)
 
             table = page.extract_table()
@@ -132,7 +161,7 @@ def extract_transactions_from_pdf(uploaded_pdf, progress_callback=None) -> pd.Da
 
             # Assume first row is header, rest are data
             for row in table[1:]:
-                # Make sure row has at least 8 cells
+                # Ensure row has at least 8 cells
                 row = (row + [""] * 8)[:8]
                 (
                     posting_date,
@@ -145,7 +174,7 @@ def extract_transactions_from_pdf(uploaded_pdf, progress_callback=None) -> pd.Da
                     balance,
                 ) = row
 
-                records.append(
+                chunk_records.append(
                     {
                         "Posting Date": posting_date,
                         "Value Date": value_date,
@@ -157,6 +186,33 @@ def extract_transactions_from_pdf(uploaded_pdf, progress_callback=None) -> pd.Da
                         "Balance": balance,
                     }
                 )
+                total_records += 1
+
+            # Flush to Google Sheets every CHUNK_PAGES
+            if page_idx % CHUNK_PAGES == 0 and chunk_records:
+                df_chunk = pd.DataFrame(chunk_records)
+                next_row_index = append_chunk_to_worksheet(
+                    worksheet,
+                    df_chunk,
+                    next_row_index,
+                )
+
+                # Clear in-memory chunk
+                chunk_records = []
+                del df_chunk
+                gc.collect()
+
+        # Flush any remaining records after the last page
+        if chunk_records:
+            df_chunk = pd.DataFrame(chunk_records)
+            next_row_index = append_chunk_to_worksheet(
+                worksheet,
+                df_chunk,
+                next_row_index,
+            )
+            chunk_records = []
+            del df_chunk
+            gc.collect()
 
     # Drop file bytes from memory ASAP
     pdf_file.close()
@@ -164,8 +220,7 @@ def extract_transactions_from_pdf(uploaded_pdf, progress_callback=None) -> pd.Da
     del file_bytes
     gc.collect()
 
-    df = pd.DataFrame(records)
-    return df
+    return total_records
 
 
 # =========================
@@ -175,7 +230,7 @@ def extract_transactions_from_pdf(uploaded_pdf, progress_callback=None) -> pd.Da
 st.set_page_config(page_title="Bank Statement Automation", layout="wide")
 
 st.title("Bank Statement Automation")
-st.write("Upload a bank statement PDF → extract → upload to Google Sheets.")
+st.write("Upload a bank statement PDF → extract → upload to Google Sheets (chunked).")
 
 st.markdown(
     "**Output columns (matched to PDF):** "
@@ -208,8 +263,8 @@ if uploaded_pdf:
             progress_bar.progress(pct)
 
         try:
-            with st.spinner("Extracting PDF… (no data will be shown)"):
-                df_tx = extract_transactions_from_pdf(
+            with st.spinner("Extracting from PDF and uploading to Google Sheets…"):
+                total_rows = process_pdf_and_stream_to_gsheet(
                     uploaded_pdf,
                     progress_callback=progress_callback,
                 )
@@ -217,17 +272,12 @@ if uploaded_pdf:
             # Clear progress UI
             progress_bar.empty()
 
-            if df_tx.empty:
+            if total_rows == 0:
                 status_text.error("No transactions were found in the PDF.")
             else:
                 status_text.success(
-                    f"Finished extracting {len(df_tx)} rows from PDF."
+                    f"Finished extracting and uploading {total_rows} rows to Google Sheets."
                 )
-
-                # Upload to Google Sheets (no preview shown)
-                with st.spinner("Uploading to Google Sheets…"):
-                    upload_df_to_gsheet(df_tx)
-
                 st.success(
                     "Upload complete! Check the 'Raw_Data' tab in your Google Sheet."
                 )
@@ -242,7 +292,7 @@ if uploaded_pdf:
 
         # Best-effort cleanup of data from memory
         try:
-            del df_tx
+            del total_rows
         except NameError:
             pass
         gc.collect()
