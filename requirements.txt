@@ -1,4 +1,5 @@
 streamlit
+PyPDF2
 pdfplumber
 pandas
 gspread
