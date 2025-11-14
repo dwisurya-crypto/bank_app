@@ -1,86 +1,84 @@
 import io
+import logging
+import gc
+
 import pdfplumber
 import pandas as pd
 import streamlit as st
 import gspread
 from google.oauth2.service_account import Credentials
-import gc
-import os
-import logging
-
-# ==========================================================
-# STRICT MODE SECURITY CONTROLS
-# ==========================================================
-
-# Disable ALL Streamlit logs
-logging.getLogger("streamlit").setLevel(logging.CRITICAL)
-os.environ["STREAMLIT_SUPPRESS_LOGS"] = "1"
-
-# Disable Streamlit file uploader history caching
-st.session_state.clear()
 
 
-# ==========================================================
-# CONFIG
-# ==========================================================
+# =========================
+# HARDEN STREAMLIT BEHAVIOUR
+# =========================
+
+# Hide detailed error tracebacks in the UI
+st.set_option("client.showErrorDetails", False)
+
+# Make Streamlit + friends as quiet as possible
+for logger_name in [
+    "streamlit",
+    "tornado",
+    "py.warnings",
+    "asyncio",
+]:
+    logging.getLogger(logger_name).setLevel(logging.ERROR)
+
+
+# =========================
+# CONFIG — EDIT IF NEEDED
+# =========================
+
+# Use ONLY the ID part between /d/ and /edit in your Sheet URL
 SPREADSHEET_ID = "1UcjF-L0GWBetcJqA1t1UMyrt54ATUAR-22ozQEnVjQM"
 WORKSHEET_NAME = "Raw_Data"
 SERVICE_ACCOUNT_FILE = "service_account.json"
 
+# Scopes for Google Sheets + Drive
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
 
-# ==========================================================
-# GOOGLE SHEETS CLIENT
-# ==========================================================
-def get_gsheet_client():
-    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+
+# =========================
+# GOOGLE SHEETS HELPER
+# =========================
+
+def get_gspread_client():
+    """Create an authorized gspread client using the service account JSON."""
     creds = Credentials.from_service_account_file(
-        SERVICE_ACCOUNT_FILE, scopes=scopes
+        SERVICE_ACCOUNT_FILE,
+        scopes=SCOPES,
     )
-    return gspread.authorize(creds)
+    client = gspread.authorize(creds)
+    return client
 
 
-# ==========================================================
-# UPLOAD CLEANED DF TO SHEETS
-# ==========================================================
-def upload_df_to_gsheet(df):
-    client = get_gsheet_client()
+def upload_df_to_gsheet(df: pd.DataFrame):
+    """
+    Upload the given DataFrame to the configured Google Sheet and worksheet.
+    Clears existing data and writes the new one.
+    """
+    client = get_gspread_client()
     sh = client.open_by_key(SPREADSHEET_ID)
 
+    # Get or create worksheet
     try:
-        ws = sh.worksheet(WORKSHEET_NAME)
-    except:
-        ws = sh.add_worksheet(WORKSHEET_NAME, rows=1000, cols=20)
+        worksheet = sh.worksheet(WORKSHEET_NAME)
+    except gspread.WorksheetNotFound:
+        worksheet = sh.add_worksheet(
+            title=WORKSHEET_NAME,
+            rows=str(len(df) + 10),
+            cols=str(len(df.columns) + 5),
+        )
 
-    ws.clear()
+    # Clear existing data
+    worksheet.clear()
 
-    # Upload including column headers
-    values = [df.columns.tolist()] + df.astype(str).fillna("").values.tolist()
-    ws.update("A1", values)
-
-
-# ==========================================================
-# EXTRACT TABLES FROM PDF
-# ==========================================================
-def extract_transactions(file_bytes):
-    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-        pages = len(pdf.pages)
-        final_rows = []
-
-        for i, page in enumerate(pdf.pages):
-            st.write(f"Reading page {i+1}/{pages}…")  # Safe: no data exposed
-
-            table = page.extract_table()
-            if not table or len(table) <= 1:
-                continue
-
-            header = table[0]
-            rows = table[1:]
-
-            if len(header) >= 8:
-                for row in rows:
-                    final_rows.append(row[:8])
-
-    df = pd.DataFrame(final_rows, columns=[
+    # Ensure column order (for safety)
+    ordered_cols = [
         "Posting Date",
         "Value Date",
         "Transaction Branch",
@@ -88,46 +86,166 @@ def extract_transactions(file_bytes):
         "Description",
         "Debit",
         "Credit",
-        "Balance"
-    ])
+        "Balance",
+    ]
+    df = df[ordered_cols]
 
+    # Prepare values: header row + data rows as list of lists
+    values = [list(df.columns)] + df.astype(str).fillna("").values.tolist()
+
+    # Write starting at A1
+    worksheet.update("A1", values)
+
+
+# =========================
+# PDF EXTRACTION LOGIC
+# =========================
+
+def extract_transactions_from_pdf(uploaded_pdf, progress_callback=None) -> pd.DataFrame:
+    """
+    Read the uploaded PDF and return a DataFrame with columns:
+    Posting Date, Value Date, Transaction Branch,
+    Reference Number, Description, Debit, Credit, Balance
+    """
+    # Read bytes once, then immediately drop reference to the uploader object
+    file_bytes = uploaded_pdf.read()
+    pdf_file = io.BytesIO(file_bytes)
+
+    # Best-effort: drop references early
+    uploaded_pdf = None
+    del uploaded_pdf
+    gc.collect()
+
+    records = []
+
+    with pdfplumber.open(pdf_file) as pdf:
+        total_pages = len(pdf.pages)
+
+        for page_idx, page in enumerate(pdf.pages, start=1):
+            # Update progress in Streamlit if callback is provided
+            if progress_callback is not None:
+                progress_callback(page_idx, total_pages)
+
+            table = page.extract_table()
+            if not table:
+                continue
+
+            # Assume first row is header, rest are data
+            for row in table[1:]:
+                # Make sure row has at least 8 cells
+                row = (row + [""] * 8)[:8]
+                (
+                    posting_date,
+                    value_date,
+                    branch,
+                    ref_number,
+                    desc_,
+                    debit,
+                    credit,
+                    balance,
+                ) = row
+
+                records.append(
+                    {
+                        "Posting Date": posting_date,
+                        "Value Date": value_date,
+                        "Transaction Branch": branch,
+                        "Reference Number": ref_number,
+                        "Description": desc_,
+                        "Debit": debit,
+                        "Credit": credit,
+                        "Balance": balance,
+                    }
+                )
+
+    # Drop file bytes from memory ASAP
+    pdf_file.close()
+    del pdf_file
+    del file_bytes
+    gc.collect()
+
+    df = pd.DataFrame(records)
     return df
 
 
-# ==========================================================
-# STREAMLIT UI
-# ==========================================================
-st.title("Bank Statement Automation — Secure Strict Mode")
+# =========================
+# STREAMLIT APP
+# =========================
 
-st.write("Upload → Extract → Upload to Google Sheets (no data displayed).")
+st.set_page_config(page_title="Bank Statement Automation", layout="wide")
 
+st.title("Bank Statement Automation")
+st.write("Upload a bank statement PDF → extract → upload to Google Sheets.")
 
-uploaded_file = st.file_uploader("Upload bank statement PDF", type=["pdf"])
+st.markdown(
+    "**Output columns (matched to PDF):** "
+    "`Posting Date`, `Value Date`, `Transaction Branch`, "
+    "`Reference Number`, `Description`, `Debit`, `Credit`, `Balance`."
+)
 
+# File uploader (single file, no history UI)
+uploaded_pdf = st.file_uploader(
+    "Upload bank statement PDF",
+    type=["pdf"],
+    accept_multiple_files=False,
+    key="pdf_uploader",
+)
 
-if uploaded_file is not None:
-
-    # Read file — STRICT MODE: store in local var only
-    pdf_bytes = uploaded_file.read()
-
+if uploaded_pdf:
     if st.button("Process PDF"):
-        st.info("Extracting PDF… (no data will be shown)")
+        # Progress placeholders
+        status_text = st.empty()
+        progress_bar = st.progress(0)
 
-        df_tx = extract_transactions(pdf_bytes)
+        def progress_callback(current_page, total_pages):
+            if total_pages <= 0:
+                return
+            pct = int(current_page / total_pages * 100)
+            status_text.info(
+                f"Reading page {current_page} of {total_pages} "
+                f"({pct}%)…"
+            )
+            progress_bar.progress(pct)
 
-        st.info("Uploading data to Google Sheets…")
-        upload_df_to_gsheet(df_tx)
+        try:
+            with st.spinner("Extracting PDF… (no data will be shown)"):
+                df_tx = extract_transactions_from_pdf(
+                    uploaded_pdf,
+                    progress_callback=progress_callback,
+                )
 
-        # STRICT MODE: wipe sensitive data from memory
-        del pdf_bytes
-        del df_tx
+            # Clear progress UI
+            progress_bar.empty()
+
+            if df_tx.empty:
+                status_text.error("No transactions were found in the PDF.")
+            else:
+                status_text.success(
+                    f"Finished extracting {len(df_tx)} rows from PDF."
+                )
+
+                # Upload to Google Sheets (no preview shown)
+                with st.spinner("Uploading to Google Sheets…"):
+                    upload_df_to_gsheet(df_tx)
+
+                st.success(
+                    "Upload complete! Check the 'Raw_Data' tab in your Google Sheet."
+                )
+
+        except Exception:
+            # Generic user-friendly error. Details are hidden by showErrorDetails=False
+            progress_bar.empty()
+            status_text.error(
+                "Unexpected error while processing the PDF. "
+                "Please try again or contact the owner."
+            )
+
+        # Best-effort cleanup of data from memory
+        try:
+            del df_tx
+        except NameError:
+            pass
         gc.collect()
 
-        # Delete reference inside Streamlit session state
-        st.session_state.clear()
-
-        st.success("Completed ✔ All data uploaded & fully wiped from memory.")
-
-
-# FINAL SECURITY NOTE
-st.caption("Strict security mode enabled: logs disabled, history disabled, memory wiped.")
+else:
+    st.info("Please upload a PDF bank statement to get started.")
