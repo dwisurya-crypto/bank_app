@@ -1,0 +1,23 @@
+# Python junk
+__pycache__/
+*.pyc
+
+# Virtual environments
+venv/
+testenv/
+.env/
+
+# macOS junk
+.DS_Store
+
+# Streamlit / cache
+.streamlit/
+.cache/
+
+# Data files we never want in repo
+*.pdf
+*.xlsx
+*.csv
+
+# Never upload secrets
+*.json
